@@ -1,0 +1,267 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: ${{ github.repository }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Spin up Mongo + Redis + Kafka, then boot every backend service against
+  #    them and smoke-test that they actually come up.
+  # ---------------------------------------------------------------------------
+  integration:
+    name: Infra + backend services smoke test
+    runs-on: ubuntu-latest
+
+    services:
+      mongodb:
+        image: mongo:6
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1})'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+      # Single-node Kafka in KRaft mode (no Zookeeper needed).
+      kafka:
+        image: bitnami/kafka:3.7
+        ports:
+          - 9092:9092
+        env:
+          KAFKA_CFG_NODE_ID: "0"
+          KAFKA_CFG_PROCESS_ROLES: controller,broker
+          KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@127.0.0.1:9093
+          ALLOW_PLAINTEXT_LISTENER: "yes"
+        options: >-
+          --health-cmd "bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/9092'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Wait for infra ports
+        run: |
+          for port in 27017 6379 9092; do
+            for i in $(seq 1 30); do
+              (echo > /dev/tcp/127.0.0.1/$port) >/dev/null 2>&1 && break
+              echo "waiting for port $port..."; sleep 2
+            done
+          done
+
+      - name: Start backend-tenderflow (monolith)
+        working-directory: backend-tenderflow
+        env:
+          BE_PORT: 3000
+          DB_URI: mongodb://localhost:27017/tenderflow_ci
+          REDIS_URI: redis://localhost:6379
+          JWT_SECRET: ci_test_secret
+          NODE_ENV: test
+        run: |
+          npm ci
+          nohup node server.js > /tmp/backend.log 2>&1 &
+          echo $! > /tmp/backend.pid
+
+      - name: Start auth-service
+        working-directory: microservices/auth-service
+        env:
+          PORT: 4001
+          MONGO_URI: mongodb://localhost:27017/tenderflow_auth_ci
+          JWT_SECRET: ci_test_secret
+        run: |
+          npm ci
+          nohup node server.js > /tmp/auth.log 2>&1 &
+          echo $! > /tmp/auth.pid
+
+      - name: Start tender-service
+        working-directory: microservices/tender-service
+        env:
+          PORT: 4002
+          MONGO_URI: mongodb://localhost:27017/tenderflow_tender_ci
+          REDIS_URI: redis://localhost:6379
+          JWT_SECRET: ci_test_secret
+        run: |
+          npm ci
+          nohup node server.js > /tmp/tender.log 2>&1 &
+          echo $! > /tmp/tender.pid
+
+      - name: Start quotation-service
+        working-directory: microservices/quotation-service
+        env:
+          PORT: 4003
+          MONGO_URI: mongodb://localhost:27017/tenderflow_quotation_ci
+          JWT_SECRET: ci_test_secret
+        run: |
+          npm ci
+          nohup node server.js > /tmp/quotation.log 2>&1 &
+          echo $! > /tmp/quotation.pid
+
+      - name: Health-check all backend services
+        run: |
+          check_http() {
+            name=$1; url=$2
+            for i in $(seq 1 15); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' "$url" || echo 000)
+              if [ "$code" != "000" ]; then echo "$name is up ($url -> $code)"; return 0; fi
+              sleep 2
+            done
+            echo "$name never responded at $url"; return 1
+          }
+          check_http "backend-tenderflow" "http://localhost:3000/"
+          check_http "backend-tenderflow /tender/health" "http://localhost:3000/tender/health"
+          check_http "backend-tenderflow /quotation/health" "http://localhost:3000/quotation/health"
+          check_http "auth-service" "http://localhost:4001/heath"
+          check_http "tender-service" "http://localhost:4002/tenders"
+          check_http "quotation-service" "http://localhost:4003/quotation"
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: |
+          for f in /tmp/backend.log /tmp/auth.log /tmp/tender.log /tmp/quotation.log; do
+            echo "=== $f ==="; cat "$f" 2>/dev/null || true
+          done
+
+      - name: Stop backend services
+        if: always()
+        run: |
+          for pidfile in /tmp/backend.pid /tmp/auth.pid /tmp/tender.pid /tmp/quotation.pid; do
+            [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null || true
+          done
+
+  # ---------------------------------------------------------------------------
+  # 2. Build backend Docker images (monolith + 3 microservices) and push to GHCR.
+  # ---------------------------------------------------------------------------
+  build-backend:
+    name: Build & push backend images
+    needs: integration
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - name: backend
+            context: backend-tenderflow
+          - name: auth-service
+            context: microservices/auth-service
+          - name: tender-service
+            context: microservices/tender-service
+          - name: quotation-service
+            context: microservices/quotation-service
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.name }}
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.name }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.name }}:latest
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  # ---------------------------------------------------------------------------
+  # 3. Build the frontend and deploy it behind nginx.
+  # ---------------------------------------------------------------------------
+  build-and-deploy-frontend:
+    name: Build frontend & deploy to nginx
+    needs: build-backend
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: tenderflow-pro/package-lock.json
+
+      - name: Install & build
+        working-directory: tenderflow-pro
+        run: |
+          npm ci
+          npm run build
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push nginx-served frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: tenderflow-pro
+          file: tenderflow-pro/Dockerfile.prod
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/frontend:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/frontend:latest
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
+      # Deploys over SSH to a host running Docker, pulling the freshly pushed
+      # nginx image and restarting the container. Requires these repo secrets:
+      #   DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY
+      # Skips automatically (instead of failing) until they're configured.
+      - name: Deploy frontend container to server
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push' && secrets.DEPLOY_HOST != ''
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/frontend:latest
+            docker rm -f tenderflow-frontend || true
+            docker run -d --name tenderflow-frontend \
+              --restart unless-stopped \
+              -p 80:80 \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/frontend:latest

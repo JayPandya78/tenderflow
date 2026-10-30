@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+backend-tenderflow/uploads/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+
+# Build folders
+dist/
+build/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
